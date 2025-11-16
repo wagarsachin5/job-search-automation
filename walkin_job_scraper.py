@@ -1,351 +1,441 @@
-import requests
-from bs4 import BeautifulSoup
+#!/usr/bin/env python3
+"""
+Combined Walk-in + E-commerce Job Scraper (Pune)
+
+Sources: Naukri, Indeed, Google Search, LinkedIn (public search), Shine
+Features:
+ - Filters for Pune region
+ - Filters for E-commerce keywords and/or Walk-in keywords (combined)
+ - Freshness filter: only items with "today" / "just posted" / "1 day" signals
+ - Extracts emails and phone numbers when present
+ - Deduplicates by link
+ - Tracks already-sent jobs using SQLite (seen_jobs.db) so emails contain only NEW jobs
+ - Sends results as an HTML email via SMTP (use GH Secrets)
+
+Usage (locally):
+  pip install requests beautifulsoup4 lxml python-dotenv
+  python walkin_job_scraper.py
+
+Environment variables (recommended to set as GitHub Secrets):
+  EMAIL_HOST (smtp.gmail.com)
+  EMAIL_PORT (587)
+  EMAIL_USER
+  EMAIL_PASS (Gmail App Password)
+  RECIPIENT_EMAIL
+  MAX_RESULTS (optional, default 25)
+"""
+import os
 import re
+import time
+import sqlite3
 import smtplib
-from datetime import datetime, timedelta
+from pathlib import Path
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ---------------- CONFIG ----------------
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
+
+if not (EMAIL_USER and EMAIL_PASS and RECIPIENT_EMAIL):
+    raise SystemExit("Please set EMAIL_USER, EMAIL_PASS and RECIPIENT_EMAIL in environment or GitHub Secrets.")
+
+# Target city and keywords
 TARGET_CITIES = [
-    "pune", "pimpri", "pcmc", "pimpri chinchwad", 
-    "hadapsar", "baner", "wakad", "hinge khurd", "kharadi"
+    "pune", "pimpri", "pimpri chinchwad", "pcmc", "hadapsar", "baner", "wakad", "kharadi"
 ]
-
 ROLE_KEYWORDS = [
-    "ecommerce", "e-commerce", "amazon", "flipkart",
-    "marketplace", "catalog", "listing", "e commerce"
+    "ecommerce", "e-commerce", "amazon", "flipkart", "marketplace", "catalog", "listing", "e commerce"
 ]
+WALKIN_KEYWORDS = ["walk in", "walk-in", "walkin", "walkin interview", "walk in interview", "walk-in drive"]
 
-WALKIN_KEYWORDS = [
-    "walk in", "walk-in", "walkin", "walkin interview", "walk in interview"
-]
+# contact regex
+EMAIL_REGEX = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+PHONE_REGEX = r"\b(?:\+91[\-\s]?)?[6-9]\d{9}\b"
 
-# Regex for contacts
-EMAIL_REGEX = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-PHONE_REGEX = r"\b[6-9]\d{9}\b"
+# DB for seen jobs
+DB_PATH = Path(__file__).parent / "seen_jobs.db"
 
-# Email config (use GitHub secrets)
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_PORT = 587
-EMAIL_USER = "YOUR_EMAIL"
-EMAIL_PASS = "YOUR_APP_PASSWORD"
-RECIPIENT_EMAIL = "YOUR_EMAIL"
+# ---------------- Helpers ----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seen (
+            link TEXT PRIMARY KEY,
+            first_seen INTEGER
+        )
+        """
+    )
+    conn.commit()
+    return conn
 
-# Freshness filter: only jobs posted in last 1 day
-ONE_DAY_AGO = datetime.now() - timedelta(days=1)
+def is_seen(conn, link):
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM seen WHERE link = ?", (link,))
+    return c.fetchone() is not None
 
-# ----------------------------------------
-
+def mark_seen(conn, link):
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO seen (link, first_seen) VALUES (?, ?)", (link, int(time.time())))
+    conn.commit()
 
 def extract_contact(text):
+    if not text:
+        return [], []
     emails = list(set(re.findall(EMAIL_REGEX, text)))
     phones = list(set(re.findall(PHONE_REGEX, text)))
-    return emails, phones
+    # normalize phones (last 10 digits)
+    norm_phones = []
+    for p in phones:
+        p_clean = re.sub(r"[^\d]", "", p)
+        if len(p_clean) > 10:
+            p_clean = p_clean[-10:]
+        if len(p_clean) == 10:
+            norm_phones.append(p_clean)
+    return emails, norm_phones
 
-
-def matches_filters(text):
+def text_has_city(text):
+    if not text:
+        return False
     t = text.lower()
-    return (
-        any(city in t for city in TARGET_CITIES) and
-        any(k in t for k in ROLE_KEYWORDS) and
-        any(w in t for w in WALKIN_KEYWORDS)
-    )
+    return any(city in t for city in TARGET_CITIES)
 
+def text_matches_role_or_walkin(text):
+    if not text:
+        return False
+    t = text.lower()
+    return (any(k in t for k in ROLE_KEYWORDS) or any(w in t for w in WALKIN_KEYWORDS))
 
-# ---------------- SCRAPERS ----------------
+def is_recent(text):
+    """
+    Heuristic: check if text contains markers meaning posted today / just posted / 1 day ago
+    """
+    if not text:
+        return False
+    t = text.lower()
+    markers = ["just posted", "posted today", "today", "1 day ago", "posted 1 day ago", "posted today", "just now"]
+    return any(m in t for m in markers)
 
-def scrape_naukri_walkins():
-    print("Scraping Naukri Walk-ins...")
-    url = "https://www.naukri.com/walkin-jobs"
-    jobs = []
+# ---------------- Scrapers ----------------
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+def fetch(url, timeout=15):
     try:
-        soup = BeautifulSoup(requests.get(url).text, "html.parser")
-        cards = soup.find_all("article")
-
-        for card in cards:
-            text = card.get_text(" ", strip=True)
-
-            # freshness check
-            date_tag = card.find("span", {"class": "job-post-day"})
-            if date_tag:
-                posted = date_tag.text.strip().lower()
-                if "day" in posted and "1" not in posted:
-                    continue
-
-            if matches_filters(text):
-                title_tag = card.find("a")
-                title = title_tag.text.strip() if title_tag else "NA"
-                company = card.find("span", {"class": "comp-name"})
-                company = company.text.strip() if company else "Not available"
-                link = title_tag["href"] if title_tag else "#"
-
-                emails, phones = extract_contact(text)
-
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "description": text,
-                    "link": link,
-                    "emails": emails,
-                    "phones": phones
-                })
-
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
+        else:
+            print(f"Fetch {url} returned status {r.status_code}")
+            return None
     except Exception as e:
-        print("Naukri Error:", e)
+        print(f"Fetch error {url}: {e}")
+        return None
 
-    return jobs
-
-
-
-def scrape_foundit_walkins():
-    print("Scraping Foundit Walk-ins...")
-    url = "https://www.foundit.in/search/walkin-jobs"
+# --- Naukri Walk-ins & E-commerce ---
+def scrape_naukri():
+    print("Scraping Naukri...")
     jobs = []
-
-    try:
-        soup = BeautifulSoup(requests.get(url).text, "html.parser")
-        cards = soup.find_all("div", class_="job-tuple")
-
-        for card in cards:
-            text = card.get_text(" ", strip=True).lower()
-
-            # Foundit freshness check
-            date_tag = card.find("span", class_="posted-date")
-            if date_tag:
-                if "1 day ago" not in date_tag.text.lower():
-                    continue
-
-            if matches_filters(text):
-                title = card.find("h3").text.strip() if card.find("h3") else "NA"
-                company = card.find("span", class_="company-name")
-                company = company.text.strip() if company else "Not available"
-                link = card.find("a")["href"]
-
-                emails, phones = extract_contact(text)
-
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "description": text,
-                    "link": link,
-                    "emails": emails,
-                    "phones": phones
-                })
-
-    except Exception as e:
-        print("Foundit Error:", e)
-
-    return jobs
-
-
-
-def scrape_shine_walkins():
-    print("Scraping Shine Walk-ins...")
-    url = "https://www.shine.com/job-search/walkin-jobs"
-    jobs = []
-
-    try:
-        soup = BeautifulSoup(requests.get(url).text, "html.parser")
-        cards = soup.find_all("div", class_="result-display__profile")
-
-        for card in cards:
-            text = card.get_text(" ", strip=True).lower()
-
-            # Shine freshness check
-            if "1 day ago" not in text and "posted today" not in text:
+    base = "https://www.naukri.com/walkin-jobs"
+    html = fetch(base)
+    if not html:
+        return jobs
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.find_all("article")
+    for c in cards:
+        try:
+            text = c.get_text(" ", strip=True)
+            # basic freshness heuristic
+            if not is_recent(text):
                 continue
-
-            if matches_filters(text):
-                title = card.find("h2").text.strip() if card.find("h2") else "NA"
-                company = card.find("span", class_="result-display__profile__company-name")
-                company = company.text.strip() if company else "Not available"
-                link = "https://www.shine.com" + card.find("a")["href"]
-
-                emails, phones = extract_contact(text)
-
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "description": text,
-                    "link": link,
-                    "emails": emails,
-                    "phones": phones
-                })
-
-    except Exception as e:
-        print("Shine Error:", e)
-
-    return jobs
-
-
-
-def scrape_timesjobs_walkins():
-    print("Scraping TimesJobs Walk-ins...")
-    url = "https://www.timesjobs.com/candidate/job-search.html?searchType=personalizedSearch&txtKeywords=walkin&txtLocation=Pune"
-    jobs = []
-
-    try:
-        soup = BeautifulSoup(requests.get(url).text, "html.parser")
-        cards = soup.find_all("li", class_="clearfix job-bx wht-shd-bx")
-
-        for card in cards:
-            text = card.get_text(" ", strip=True).lower()
-
-            # freshness
-            date_tag = card.find("span", class_="sim-posted")
-            if date_tag and "1 day ago" not in date_tag.text.lower():
+            if not text_has_city(text) or not text_matches_role_or_walkin(text):
                 continue
+            a = c.find("a", href=True)
+            link = a["href"] if a else None
+            title = a.get_text(strip=True) if a else (c.find("h2").get_text(strip=True) if c.find("h2") else "No title")
+            comp = c.select_one(".comp-name")
+            company = comp.get_text(strip=True) if comp else ""
+            emails, phones = extract_contact(text)
+            jobs.append({
+                "title": title,
+                "company": company,
+                "location": "Pune",
+                "description": text,
+                "link": link,
+                "source": "Naukri",
+                "emails": emails,
+                "phones": phones,
+            })
+        except Exception:
+            continue
+    return jobs[:MAX_RESULTS]
 
-            if matches_filters(text):
-                title = card.find("h2").text.strip()
-                company = card.find("h3", class_="joblist-comp-name").text.strip()
-                link = card.find("h2").a["href"]
-
-                emails, phones = extract_contact(text)
-
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "description": text,
-                    "link": link,
-                    "emails": emails,
-                    "phones": phones
-                })
-
-    except Exception as e:
-        print("TimesJobs Error:", e)
-
-    return jobs
-
-
-
-def scrape_indeed_walkins():
-    print("Scraping Indeed Walk-ins...")
+# --- Indeed ---
+def scrape_indeed():
+    print("Scraping Indeed...")
+    jobs = []
     url = "https://in.indeed.com/jobs?q=walk-in+ecommerce&l=Pune"
-    jobs = []
-
-    try:
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-        soup = BeautifulSoup(html, "html.parser")
-        cards = soup.find_all("div", class_="cardOutline")
-
-        for card in cards:
-            text = card.get_text(" ", strip=True).lower()
-
-            # freshness
-            if "just posted" not in text and "1 day ago" not in text:
+    html = fetch(url)
+    if not html:
+        return jobs
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.find_all("div", class_=lambda v: v and ("jobsearch-SerpJobCard" in v or "slider_item" in v or "result" in v))
+    if not cards:
+        cards = soup.find_all("a", attrs={"data-hide-spinner": True})
+    for c in cards:
+        try:
+            text = c.get_text(" ", strip=True)
+            if not is_recent(text):
                 continue
+            if not text_has_city(text) or not text_matches_role_or_walkin(text):
+                continue
+            a = c.find("a", href=True)
+            link = "https://in.indeed.com" + a["href"] if a and a.get("href") and a.get("href").startswith("/") else (a["href"] if a and a.get("href") else None)
+            title = c.find("h2") or c.find("a")
+            title_text = title.get_text(strip=True) if title else "No title"
+            company = c.select_one(".companyName")
+            company_text = company.get_text(strip=True) if company else ""
+            emails, phones = extract_contact(text)
+            jobs.append({
+                "title": title_text,
+                "company": company_text,
+                "location": "Pune",
+                "description": text,
+                "link": link,
+                "source": "Indeed",
+                "emails": emails,
+                "phones": phones,
+            })
+        except Exception:
+            continue
+    return jobs[:MAX_RESULTS]
 
-            if matches_filters(text):
-                title = card.find("h2").text.strip()
-                company = card.find("span", class_="companyName").text.strip()
-                link = "https://in.indeed.com" + card.find("a")["href"]
-
-                emails, phones = extract_contact(text)
-
-                jobs.append({
-                    "title": title,
-                    "company": company,
-                    "description": text,
-                    "link": link,
-                    "emails": emails,
-                    "phones": phones
-                })
-
-    except Exception as e:
-        print("Indeed Error:", e)
-
-    return jobs
-
-
-
-def scrape_google_walkins():
-    print("Scraping Google Search Walk-ins...")
+# --- Google Search snippets ---
+def scrape_google():
+    print("Scraping Google Search snippets...")
+    jobs = []
     q = "Walk-in E-commerce jobs Pune"
     url = f"https://www.google.com/search?q={q.replace(' ', '+')}"
+    html = fetch(url)
+    if not html:
+        return jobs
+    soup = BeautifulSoup(html, "lxml")
+    snippets = soup.select("div.BNeawe.s3v9rd.AP7Wnd") or soup.select("div.BNeawe")
+    for s in snippets:
+        try:
+            text = s.get_text(" ", strip=True)
+            if not is_recent(text):
+                continue
+            if not text_has_city(text) or not text_matches_role_or_walkin(text):
+                continue
+            emails, phones = extract_contact(text)
+            jobs.append({
+                "title": "Google snippet",
+                "company": "",
+                "location": "Pune",
+                "description": text,
+                "link": url,
+                "source": "Google",
+                "emails": emails,
+                "phones": phones,
+            })
+        except Exception:
+            continue
+    return jobs[:MAX_RESULTS]
+
+# --- LinkedIn public search (limited info) ---
+def scrape_linkedin():
+    print("Scraping LinkedIn public search (limited)...")
     jobs = []
+    q = "E-commerce Manager"
+    url = f"https://www.linkedin.com/jobs/search/?keywords={q.replace(' ', '%20')}&location=Pune"
+    html = fetch(url)
+    if not html:
+        return jobs
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.select("ul.jobs-search__results-list li") or soup.select(".result-card.job-result-card")
+    for c in cards:
+        try:
+            text = c.get_text(" ", strip=True)
+            if not text_has_city(text) or not text_matches_role_or_walkin(text):
+                continue
+            a = c.find("a", href=True)
+            link = a["href"] if a else None
+            title_tag = c.select_one(".job-card-list__title") or a
+            title = title_tag.get_text(strip=True) if title_tag else "No title"
+            company_tag = c.select_one(".job-card-container__company-name")
+            company = company_tag.get_text(strip=True) if company_tag else ""
+            emails, phones = extract_contact(text)
+            jobs.append({
+                "title": title,
+                "company": company,
+                "location": "Pune",
+                "description": text,
+                "link": link,
+                "source": "LinkedIn",
+                "emails": emails,
+                "phones": phones,
+            })
+        except Exception:
+            continue
+    return jobs[:MAX_RESULTS]
 
-    try:
-        html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}).text
-        soup = BeautifulSoup(html, "html.parser")
-        snippets = soup.find_all("div", class_="BNeawe s3v9rd AP7Wnd")
+# --- Shine ---
+def scrape_shine():
+    print("Scraping Shine...")
+    jobs = []
+    url = "https://www.shine.com/job-search/walkin-jobs"
+    html = fetch(url)
+    if not html:
+        return jobs
+    soup = BeautifulSoup(html, "lxml")
+    cards = soup.find_all("div", class_="result-display__profile")
+    for c in cards:
+        try:
+            text = c.get_text(" ", strip=True)
+            if not is_recent(text):
+                continue
+            if not text_has_city(text) or not text_matches_role_or_walkin(text):
+                continue
+            a = c.find("a", href=True)
+            link = ("https://www.shine.com" + a["href"]) if a and a.get("href") else None
+            title = c.find("h2").get_text(strip=True) if c.find("h2") else "No title"
+            company = c.select_one(".result-display__profile__company-name")
+            company_text = company.get_text(strip=True) if company else ""
+            emails, phones = extract_contact(text)
+            jobs.append({
+                "title": title,
+                "company": company_text,
+                "location": "Pune",
+                "description": text,
+                "link": link,
+                "source": "Shine",
+                "emails": emails,
+                "phones": phones,
+            })
+        except Exception:
+            continue
+    return jobs[:MAX_RESULTS]
 
-        for snip in snippets:
-            text = snip.text.lower()
+# ---------------- Build & Send Email ----------------
+def dedupe_jobs(jobs):
+    out = []
+    seen_links = set()
+    for j in jobs:
+        link = j.get("link") or (j.get("title","") + j.get("company",""))
+        if not link:
+            continue
+        key = link.strip()
+        if key in seen_links:
+            continue
+        seen_links.add(key)
+        out.append(j)
+    return out
 
-            if matches_filters(text):
-                emails, phones = extract_contact(text)
+def build_email_html(jobs):
+    parts = []
+    parts.append(f"<h2>Daily Walk-in + E-commerce Jobs (Pune) — {datetime.now().strftime('%Y-%m-%d')}</h2>")
+    if not jobs:
+        parts.append("<p>No new jobs found in the last 1 day.</p>")
+    else:
+        parts.append(f"<p>Total new jobs: {len(jobs)}</p>")
+        for j in jobs:
+            parts.append("<div style='margin-bottom:12px;padding:10px;border:1px solid #e6e6e6;border-radius:6px;'>")
+            parts.append(f"<h3 style='margin:0'>{html_escape(j.get('title'))}</h3>")
+            if j.get('company'):
+                parts.append(f"<p style='margin:4px 0'><b>Company:</b> {html_escape(j.get('company'))}</p>")
+            parts.append(f"<p style='margin:4px 0'><b>Source:</b> {html_escape(j.get('source'))} ")
+            if j.get('location'):
+                parts.append(f" - {html_escape(j.get('location'))}</p>")
+            parts.append(f"<p style='margin:6px 0'>{html_escape((j.get('description') or '')[:600])}...</p>")
+            if j.get('link'):
+                parts.append(f"<p style='margin:6px 0'><a href=\"{j.get('link')}\">Open job/link</a></p>")
+            if j.get('emails'):
+                parts.append(f"<p style='margin:6px 0'><b>Emails:</b> {', '.join(map(html_escape, j.get('emails')))}</p>")
+            if j.get('phones'):
+                parts.append(f"<p style='margin:6px 0'><b>Phones:</b> {', '.join(map(html_escape, j.get('phones')))}</p>")
+            parts.append("</div>")
+    return "\n".join(parts)
 
-                jobs.append({
-                    "title": "Google Search Result",
-                    "company": "Unknown",
-                    "description": text,
-                    "link": url,
-                    "emails": emails,
-                    "phones": phones
-                })
+def html_escape(s):
+    import html as _html
+    return _html.escape(s or "")
 
-    except Exception as e:
-        print("Google Error:", e)
-
-    return jobs
-
-
-
-# ---------------- EMAIL SENDER ----------------
-
-def send_email(jobs):
-    msg = MIMEMultipart()
+def send_email(subject, html_body):
+    msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_USER
     msg["To"] = RECIPIENT_EMAIL
-    msg["Subject"] = "Daily Walk-In E-commerce Jobs (Pune) – Last 1 Day Only"
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=60) as s:
+        s.ehlo()
+        if EMAIL_PORT == 587:
+            s.starttls()
+        s.login(EMAIL_USER, EMAIL_PASS)
+        s.sendmail(EMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
 
-    html = "<h2>Today's Walk-In E-commerce Jobs (Pune)</h2>"
-
-    if not jobs:
-        html += "<p>No walk-in jobs found in the last 1 day.</p>"
-    else:
-        for job in jobs:
-            html += f"""
-            <div style='border:1px solid #ddd;padding:12px;margin-bottom:14px;'>
-                <h3>{job['title']}</h3>
-                <p><b>Company:</b> {job['company']}</p>
-                <p>{job['description'][:250]}...</p>
-                <p><b>Link:</b> <a href="{job['link']}">Open</a></p>
-            """
-
-            if job["emails"]:
-                html += f"<p><b>Emails:</b> {', '.join(job['emails'])}</p>"
-            if job["phones"]:
-                html += f"<p><b>Phones:</b> {', '.join(job['phones'])}</p>"
-
-            html += "</div>"
-
-    msg.attach(MIMEText(html, "html"))
-
-    s = smtplib.SMTP(EMAIL_HOST, EMAIL_PORT)
-    s.starttls()
-    s.login(EMAIL_USER, EMAIL_PASS)
-    s.sendmail(EMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
-    s.quit()
-
-
-
-# ---------------- MAIN ----------------
-
+# ---------------- Main ----------------
 def main():
+    conn = init_db()
     all_jobs = []
-    all_jobs += scrape_naukri_walkins()
-    all_jobs += scrape_foundit_walkins()
-    all_jobs += scrape_shine_walkins()
-    all_jobs += scrape_timesjobs_walkins()
-    all_jobs += scrape_indeed_walkins()
-    all_jobs += scrape_google_walkins()
+    # scrape each source
+    try:
+        all_jobs.extend(scrape_naukri())
+    except Exception as e:
+        print("Naukri scrape failed:", e)
+    try:
+        all_jobs.extend(scrape_indeed())
+    except Exception as e:
+        print("Indeed scrape failed:", e)
+    try:
+        all_jobs.extend(scrape_google())
+    except Exception as e:
+        print("Google scrape failed:", e)
+    try:
+        all_jobs.extend(scrape_linkedin())
+    except Exception as e:
+        print("LinkedIn scrape failed:", e)
+    try:
+        all_jobs.extend(scrape_shine())
+    except Exception as e:
+        print("Shine scrape failed:", e)
 
-    send_email(all_jobs)
+    print(f"Found {len(all_jobs)} raw candidates")
 
+    # dedupe
+    deduped = dedupe_jobs(all_jobs)
 
-if __name__ == "__main__":
+    # filter by not-seen and mark seen
+    new_jobs = []
+    for j in deduped:
+        link = j.get('link') or (j.get('title','') + j.get('company',''))
+        if not link:
+            continue
+        if not is_seen(conn, link):
+            new_jobs.append(j)
+            mark_seen(conn, link)
+
+    print(f"New jobs to send: {len(new_jobs)}")
+
+    html_body = build_email_html(new_jobs)
+    subject = f"Walk-in+Ecom Jobs (Pune) — {datetime.now().strftime('%Y-%m-%d')}"
+    try:
+        send_email(subject, html_body)
+        print("Email sent to", RECIPIENT_EMAIL)
+    except Exception as e:
+        print("Failed to send email:", e)
+
+if __name__ == '__main__':
     main()
