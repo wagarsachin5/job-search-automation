@@ -1,0 +1,34 @@
+name: Daily Walk-in E-commerce Job Alert
+
+on:
+  schedule:
+    # Runs every day at 8:30 AM IST (03:00 UTC)
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-job-alert:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        pip install requests beautifulsoup4 lxml
+
+    - name: Run walkin job scraper
+      env:
+        EMAIL_HOST: ${{ secrets.EMAIL_HOST }}
+        EMAIL_PORT: ${{ secrets.EMAIL_PORT }}
+        EMAIL_USER: ${{ secrets.EMAIL_USER }}
+        EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      run: |
+        python walkin_job_scraper.py
