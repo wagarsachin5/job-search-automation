@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
 """
-Combined Walk-in + E-commerce Job Scraper (Pune)
+Walk-in + E-commerce Job Scraper (Pune) — dotenv REMOVED
 
-Sources: Naukri, Indeed, Google Search, LinkedIn (public search), Shine
-Features:
- - Filters for Pune region
- - Filters for E-commerce keywords and/or Walk-in keywords (combined)
- - Freshness filter: only items with "today" / "just posted" / "1 day" signals
- - Extracts emails and phone numbers when present
- - Deduplicates by link
- - Tracks already-sent jobs using SQLite (seen_jobs.db) so emails contain only NEW jobs
- - Sends results as an HTML email via SMTP (use GH Secrets)
+Reads credentials from environment variables:
+  EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, RECIPIENT_EMAIL
 
-Usage (locally):
-  pip install requests beautifulsoup4 lxml python-dotenv
-  python walkin_job_scraper.py
-
-Environment variables (recommended to set as GitHub Secrets):
-  EMAIL_HOST (smtp.gmail.com)
-  EMAIL_PORT (587)
-  EMAIL_USER
-  EMAIL_PASS (Gmail App Password)
-  RECIPIENT_EMAIL
-  MAX_RESULTS (optional, default 25)
+Sources: Naukri, Indeed, Google search snippets, LinkedIn (public), Shine
+Filters: Pune + (walk-in OR e-commerce)
+Freshness: heuristic = "today", "just posted", "1 day ago", "just now"
+Deduped and emails only NEW jobs tracked in SQLite (seen_jobs.db)
 """
 import os
 import re
@@ -36,9 +22,6 @@ from email.mime.text import MIMEText
 
 import requests
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ---------------- CONFIG ----------------
 EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
@@ -49,55 +32,50 @@ RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "25"))
 
 if not (EMAIL_USER and EMAIL_PASS and RECIPIENT_EMAIL):
-    raise SystemExit("Please set EMAIL_USER, EMAIL_PASS and RECIPIENT_EMAIL in environment or GitHub Secrets.")
+    raise SystemExit("Set EMAIL_USER, EMAIL_PASS and RECIPIENT_EMAIL as environment variables (or GH Secrets).")
 
-# Target city and keywords
-TARGET_CITIES = [
-    "pune", "pimpri", "pimpri chinchwad", "pcmc", "hadapsar", "baner", "wakad", "kharadi"
-]
-ROLE_KEYWORDS = [
-    "ecommerce", "e-commerce", "amazon", "flipkart", "marketplace", "catalog", "listing", "e commerce"
-]
+TARGET_CITIES = ["pune", "pimpri", "pimpri chinchwad", "pcmc", "hadapsar", "baner", "wakad", "kharadi"]
+ROLE_KEYWORDS = ["ecommerce", "e-commerce", "amazon", "flipkart", "marketplace", "catalog", "listing", "e commerce"]
 WALKIN_KEYWORDS = ["walk in", "walk-in", "walkin", "walkin interview", "walk in interview", "walk-in drive"]
 
-# contact regex
 EMAIL_REGEX = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
 PHONE_REGEX = r"\b(?:\+91[\-\s]?)?[6-9]\d{9}\b"
 
-# DB for seen jobs
 DB_PATH = Path(__file__).parent / "seen_jobs.db"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
 
 # ---------------- Helpers ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute(
-        """
+    c.execute("""
         CREATE TABLE IF NOT EXISTS seen (
             link TEXT PRIMARY KEY,
             first_seen INTEGER
         )
-        """
-    )
+    """)
     conn.commit()
     return conn
+
 
 def is_seen(conn, link):
     c = conn.cursor()
     c.execute("SELECT 1 FROM seen WHERE link = ?", (link,))
     return c.fetchone() is not None
 
+
 def mark_seen(conn, link):
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO seen (link, first_seen) VALUES (?, ?)", (link, int(time.time())))
     conn.commit()
+
 
 def extract_contact(text):
     if not text:
         return [], []
     emails = list(set(re.findall(EMAIL_REGEX, text)))
     phones = list(set(re.findall(PHONE_REGEX, text)))
-    # normalize phones (last 10 digits)
     norm_phones = []
     for p in phones:
         p_clean = re.sub(r"[^\d]", "", p)
@@ -107,11 +85,13 @@ def extract_contact(text):
             norm_phones.append(p_clean)
     return emails, norm_phones
 
+
 def text_has_city(text):
     if not text:
         return False
     t = text.lower()
     return any(city in t for city in TARGET_CITIES)
+
 
 def text_matches_role_or_walkin(text):
     if not text:
@@ -119,18 +99,14 @@ def text_matches_role_or_walkin(text):
     t = text.lower()
     return (any(k in t for k in ROLE_KEYWORDS) or any(w in t for w in WALKIN_KEYWORDS))
 
+
 def is_recent(text):
-    """
-    Heuristic: check if text contains markers meaning posted today / just posted / 1 day ago
-    """
     if not text:
         return False
     t = text.lower()
-    markers = ["just posted", "posted today", "today", "1 day ago", "posted 1 day ago", "posted today", "just now"]
+    markers = ["just posted", "posted today", "today", "1 day ago", "posted 1 day ago", "just now"]
     return any(m in t for m in markers)
 
-# ---------------- Scrapers ----------------
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 def fetch(url, timeout=15):
     try:
@@ -144,7 +120,8 @@ def fetch(url, timeout=15):
         print(f"Fetch error {url}: {e}")
         return None
 
-# --- Naukri Walk-ins & E-commerce ---
+
+# ---------------- Scrapers ----------------
 def scrape_naukri():
     print("Scraping Naukri...")
     jobs = []
@@ -157,7 +134,6 @@ def scrape_naukri():
     for c in cards:
         try:
             text = c.get_text(" ", strip=True)
-            # basic freshness heuristic
             if not is_recent(text):
                 continue
             if not text_has_city(text) or not text_matches_role_or_walkin(text):
@@ -182,7 +158,7 @@ def scrape_naukri():
             continue
     return jobs[:MAX_RESULTS]
 
-# --- Indeed ---
+
 def scrape_indeed():
     print("Scraping Indeed...")
     jobs = []
@@ -222,7 +198,7 @@ def scrape_indeed():
             continue
     return jobs[:MAX_RESULTS]
 
-# --- Google Search snippets ---
+
 def scrape_google():
     print("Scraping Google Search snippets...")
     jobs = []
@@ -255,7 +231,7 @@ def scrape_google():
             continue
     return jobs[:MAX_RESULTS]
 
-# --- LinkedIn public search (limited info) ---
+
 def scrape_linkedin():
     print("Scraping LinkedIn public search (limited)...")
     jobs = []
@@ -292,7 +268,7 @@ def scrape_linkedin():
             continue
     return jobs[:MAX_RESULTS]
 
-# --- Shine ---
+
 def scrape_shine():
     print("Scraping Shine...")
     jobs = []
@@ -329,6 +305,7 @@ def scrape_shine():
             continue
     return jobs[:MAX_RESULTS]
 
+
 # ---------------- Build & Send Email ----------------
 def dedupe_jobs(jobs):
     out = []
@@ -343,6 +320,7 @@ def dedupe_jobs(jobs):
         seen_links.add(key)
         out.append(j)
     return out
+
 
 def build_email_html(jobs):
     parts = []
@@ -369,9 +347,11 @@ def build_email_html(jobs):
             parts.append("</div>")
     return "\n".join(parts)
 
+
 def html_escape(s):
     import html as _html
     return _html.escape(s or "")
+
 
 def send_email(subject, html_body):
     msg = MIMEMultipart("alternative")
@@ -386,11 +366,11 @@ def send_email(subject, html_body):
         s.login(EMAIL_USER, EMAIL_PASS)
         s.sendmail(EMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
 
+
 # ---------------- Main ----------------
 def main():
     conn = init_db()
     all_jobs = []
-    # scrape each source
     try:
         all_jobs.extend(scrape_naukri())
     except Exception as e:
@@ -414,10 +394,8 @@ def main():
 
     print(f"Found {len(all_jobs)} raw candidates")
 
-    # dedupe
     deduped = dedupe_jobs(all_jobs)
 
-    # filter by not-seen and mark seen
     new_jobs = []
     for j in deduped:
         link = j.get('link') or (j.get('title','') + j.get('company',''))
@@ -436,6 +414,7 @@ def main():
         print("Email sent to", RECIPIENT_EMAIL)
     except Exception as e:
         print("Failed to send email:", e)
+
 
 if __name__ == '__main__':
     main()
