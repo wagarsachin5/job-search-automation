@@ -2,8 +2,7 @@ name: Daily Walk-in E-commerce Job Alert
 
 on:
   schedule:
-    # Runs every day at 8:30 AM IST (03:00 UTC)
-    - cron: "0 3 * * *"
+    - cron: "0 3 * * *" # 8:30 AM IST
   workflow_dispatch:
 
 jobs:
@@ -21,7 +20,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install requests beautifulsoup4 lxml
+        pip install requests beautifulsoup4 lxml python-dotenv
 
     - name: Run walkin job scraper
       env:
