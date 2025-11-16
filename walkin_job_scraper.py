@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Walk-in + E-commerce Job Scraper (Pune) — dotenv REMOVED
-
-Reads credentials from environment variables:
-  EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, RECIPIENT_EMAIL
-
-Sources: Naukri, Indeed, Google search snippets, LinkedIn (public), Shine
-Filters: Pune + (walk-in OR e-commerce)
-Freshness: heuristic = "today", "just posted", "1 day ago", "just now"
-Deduped and emails only NEW jobs tracked in SQLite (seen_jobs.db)
-"""
 import os
 import requests
 from bs4 import BeautifulSoup
